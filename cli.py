@@ -160,6 +160,11 @@ def prepare_cli_args(args):
     else:
         cli_args.extend(['--server','https://acme.castle.cloud/acme/directory'])
 
+    if (args.eab_kid):
+        cli_args.extend(['--eab-kid', args.eab_kid])
+    if (args.eab_hmac_key):
+        cli_args.extend(['--eab-hmac-key', args.eab_hmac_key])
+
     if (args.no_verify_ssl): cli_args.extend(['--no-verify-ssl'])
     if (args.non_interactive): cli_args.extend(['-n'])
 
@@ -403,6 +408,8 @@ def parse_args():
     parser.add_argument('-l','--logs-dir', help='Logs directory')
     parser.add_argument('--server', help='specify an alternative ACME (Automated Certificate Management Environment) server')
     parser.add_argument('--no-verify-ssl', help='skip the SSL/TLS certificate verification', action='store_true')
+    parser.add_argument('--eab-kid', help='External Account Binding Key ID')
+    parser.add_argument('--eab-hmac-key', help='External Account Binding HMAC Key')
     parser.add_argument('--agree-tos', help='Accepts Terms of Service', action='store_true')
     parser.add_argument('--contact', help='Contact e-mail for important account notifications')
     parser.add_argument('--imap', help='Uses IMAP Authenticator for automatic reply', action='store_true')
