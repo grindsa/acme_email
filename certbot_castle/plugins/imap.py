@@ -129,29 +129,96 @@ class Authenticator(common.Plugin, interfaces.Authenticator, metaclass=abc.ABCMe
         return [self._perform_emailreply00(achall) for achall in achalls]
 
     def _perform_emailreply00(self, achall):
+        import time
         response, _ = achall.challb.response_and_validation(achall.account_key)
-
         text = 'A challenge request for S/MIME certificate has been sent. In few minutes, ACME server will send a challenge e-mail to requested recipient {}. You do not need to take ANY action, as it will be replied automatically.'.format(achall.domain)
-        display_util.notification(text,pause=False)
+        display_util.notification(text, pause=False)
+        logger.debug(f"[ACME] Waiting for challenge email for {achall.domain}")
         sent = False
+        start_time = time.time()
+
+        # Ensure we are not in IDLE before searching for unseen messages
+        logger.debug("[ACME] Exiting IDLE mode before searching for unseen messages.")
+        self.__idle(False)
+
+        # Suggestion 2: Check for unseen challenge emails before polling
+        logger.debug("[ACME] Checking for unseen messages before entering idle loop.")
+        unseen = self.imap.search(['UNSEEN'])
+        logger.debug(f"[ACME] UNSEEN message UIDs before polling: {unseen}")
+        for uid in unseen:
+            respo = self.imap.fetch(uid, ['RFC822'])
+            for message_id, data in respo.items():
+                logger.debug(f"[ACME] Pre-polling: Processing fetched message_id={message_id}")
+                if (b'RFC822' in data):
+                    msg = email.message_from_bytes(data[b'RFC822'], _class=EmailMessage, policy=policy.default)
+                    logger.debug(f"[ACME] Pre-polling: Email received: Subject={msg.get('Subject')}, From={msg.get('From')}, To={msg.get('To')}")
+                    try:
+                        response, body = castle.utils.ProcessEmailChallenge(msg, achall)
+                        logger.info(f"[ACME] Pre-polling: Challenge email matched and processed for {achall.domain}")
+                        if ('Reply-To' in msg):
+                            to = msg['Reply-To']
+                        else:
+                            to = msg['From']
+                        me = msg['To']
+                        message = 'From: {}\n'.format(me)
+                        message += 'To: {}\n'.format(to)
+                        message += 'In-Reply-To: {}\n'.format(msg['Message-ID'])
+                        message += 'Subject: Re: {}\n\n'.format(msg['Subject'])
+                        message += body
+                        try:
+                            self.smtp.sendmail(me, to, message)
+                            logger.info(f"[ACME] Pre-polling: Challenge reply sent to {to} from {me}")
+                        except (SMTPServerDisconnected, OSError):
+                            logger.warning("SMTP connection dropped. Reconnecting...")
+                            self._connect_smtp(self._imap_ssl_context)
+                            self.smtp.sendmail(me, to, message)
+                            logger.info(f"[ACME] Pre-polling: Challenge reply sent to {to} from {me} after reconnect")
+                        self.imap.add_flags(message_id, imapclient.SEEN)
+                        self.imap.add_flags(message_id, imapclient.DELETED)
+                        display_util.notification('The ACME response has been sent successfully!', pause=False)
+                        sent = True
+                        logger.info(f"[ACME] Pre-polling: Challenge email processed and flags set (SEEN, DELETED) for message_id={message_id}")
+                        logger.debug(f"[ACME] Pre-polling: Time from start to reply: {time.time() - start_time:.2f} seconds")
+                        break
+                    except (castle.utils.FromAddressMismatch, castle.utils.ReceiptAddressMismatch):
+                        logger.debug(f"[ACME] Pre-polling: Email did not match challenge, skipping message_id={message_id}")
+                        continue
+                    except castle.exception.Error as e:
+                        logger.error(f"[ACME] Pre-polling: Challenge processing error: {e}")
+                        raise errors.AuthorizationError(e.message)
+            if sent:
+                break
+        if sent:
+            logger.info(f"[ACME] Challenge reply completed in pre-polling in {time.time() - start_time:.2f} seconds")
+            return response
+
+        # ...existing polling code follows...
         for i in range(60):
+            logger.debug(f"[ACME] IMAP idle_check iteration {i}")
             try:
-                idle_resp = self.imap.idle_check(timeout=1)
+                idle_resp = self.imap.idle_check(timeout=2)
+                logger.debug(f"[ACME] idle_resp: {idle_resp}")
             except (imaplib.IMAP4.abort, OSError):
                 logger.warning("IMAP IDLE connection dropped. Reconnecting...")
                 self.__in_idle = False
                 self._connect_imap(self._imap_ssl_context)
                 continue
+            logger.debug(f"[ACME] idle_resp after check: {idle_resp}")
             for msg in idle_resp:
                 uid, state = msg
+                logger.debug(f"[ACME] Detected IMAP event: uid={uid}, state={state}")
                 if state == b'EXISTS':
+                    logger.info(f"[ACME] New email detected (uid={uid}), fetching message...")
                     self.__idle(False)
                     respo = self.imap.fetch(uid, ['RFC822'])
                     for message_id, data in respo.items():
+                        logger.debug(f"[ACME] Processing fetched message_id={message_id}")
                         if (b'RFC822' in data):
-                            msg = email.message_from_bytes(data[b'RFC822'],_class=EmailMessage,policy=policy.default)
+                            msg = email.message_from_bytes(data[b'RFC822'], _class=EmailMessage, policy=policy.default)
+                            logger.debug(f"[ACME] Email received: Subject={msg.get('Subject')}, From={msg.get('From')}, To={msg.get('To')}")
                             try:
-                                response,body = castle.utils.ProcessEmailChallenge(msg, achall)
+                                response, body = castle.utils.ProcessEmailChallenge(msg, achall)
+                                logger.info(f"[ACME] Challenge email matched and processed for {achall.domain}")
                                 if ('Reply-To' in msg):
                                     to = msg['Reply-To']
                                 else:
@@ -163,24 +230,32 @@ class Authenticator(common.Plugin, interfaces.Authenticator, metaclass=abc.ABCMe
                                 message += 'Subject: Re: {}\n\n'.format(msg['Subject'])
                                 message += body
                                 try:
-                                    self.smtp.sendmail(me,to,message)
+                                    self.smtp.sendmail(me, to, message)
+                                    logger.info(f"[ACME] Challenge reply sent to {to} from {me}")
                                 except (SMTPServerDisconnected, OSError):
                                     logger.warning("SMTP connection dropped. Reconnecting...")
                                     self._connect_smtp(self._imap_ssl_context)
-                                    self.smtp.sendmail(me,to,message)
-
-                                self.imap.add_flags(message_id,imapclient.SEEN)
-                                self.imap.add_flags(message_id,imapclient.DELETED)
-                                display_util.notification('The ACME response has been sent successfully!',pause=False)
+                                    self.smtp.sendmail(me, to, message)
+                                    logger.info(f"[ACME] Challenge reply sent to {to} from {me} after reconnect")
+                                self.imap.add_flags(message_id, imapclient.SEEN)
+                                self.imap.add_flags(message_id, imapclient.DELETED)
+                                display_util.notification('The ACME response has been sent successfully!', pause=False)
                                 sent = True
-                            except (castle.utils.FromAddressMismatch, castle.utils.ReceiptAddressMismatch): #email not from challenge, continue
+                                logger.info(f"[ACME] Challenge email processed and flags set (SEEN, DELETED) for message_id={message_id}")
+                                logger.debug(f"[ACME] Time from start to reply: {time.time() - start_time:.2f} seconds")
+                            except (castle.utils.FromAddressMismatch, castle.utils.ReceiptAddressMismatch):
+                                logger.debug(f"[ACME] Email did not match challenge, skipping message_id={message_id}")
                                 continue
                             except castle.exception.Error as e:
+                                logger.error(f"[ACME] Challenge processing error: {e}")
                                 raise errors.AuthorizationError(e.message)
-            if (sent):
+            if sent:
+                logger.info(f"[ACME] Challenge reply completed in {time.time() - start_time:.2f} seconds")
                 break
             else:
-                self.__idle(True) #no luck, we put the server in IDLE again
+                self.__idle(True)  # no luck, we put the server in IDLE again
+        if not sent:
+            logger.error(f"[ACME] Challenge email was not detected or replied to in time window ({time.time() - start_time:.2f} seconds)")
         return response
 
     def cleanup(self, achalls):  # pylint: disable=missing-function-docstring
